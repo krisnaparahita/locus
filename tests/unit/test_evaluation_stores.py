@@ -32,6 +32,7 @@ from locus.evaluation import (
     OracleReportStore,
     ReportStore,
     S3ReportStore,
+    SqliteReportStore,
     StoredReport,
     report_store,
     trend,
@@ -413,6 +414,9 @@ def test_oracle_store_needs_oracledb_for_a_real_pool() -> None:
 def test_report_store_opens_each_scheme(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     assert isinstance(report_store(str(tmp_path)), FileReportStore)
     assert isinstance(report_store(f"file://{tmp_path}"), FileReportStore)
+    sqlite = report_store(f"sqlite://{tmp_path}/evals.db")
+    assert isinstance(sqlite, SqliteReportStore)
+    assert sqlite.path == tmp_path / "evals.db"
     oci = report_store(
         "oci://ns/bucket/some/prefix?profile=P&region=eu-frankfurt-1&auth=security_token"
     )
@@ -482,6 +486,69 @@ def test_report_store_rejects_what_it_cannot_open(monkeypatch: pytest.MonkeyPatc
         report_store("s3:///prefix")
     monkeypatch.setenv(SPEC_ENV, "s3://from-env/p")
     assert isinstance(report_store(None), S3ReportStore)
+
+
+# --------------------------------------------------------------------------
+# SqliteReportStore
+# --------------------------------------------------------------------------
+
+
+def test_sqlite_store_round_trips_and_lists_newest_first(tmp_path: Path) -> None:
+    store = SqliteReportStore(tmp_path / "sub" / "evals.db")
+    stored = _three_reports(store)
+    assert isinstance(store, ReportStore)
+    assert store.spec == f"sqlite://{tmp_path}/sub/evals.db"
+    assert stored[0].passed == 3
+    assert stored[0].suite == "warden"
+    loaded = store.get(stored[1].report_id)
+    assert loaded is not None
+    assert loaded.passed == 2
+    assert loaded.fingerprint == "abcdefabcdef"
+    assert store.get("missing") is None
+    listed = store.list(suite="warden")
+    assert [item.report_id for item in listed] == [s.report_id for s in reversed(stored)]
+    assert listed[0].passed == 3
+    assert listed[0].fingerprint == "123456789abc"
+    assert listed[1].avg_score == pytest.approx(2 / 3)
+
+
+def test_sqlite_store_filters_by_suite_fingerprint_and_limit(tmp_path: Path) -> None:
+    store = SqliteReportStore(tmp_path / "evals.db")
+    _three_reports(store)
+    store.put(_report(passed=1, total=1, at=T0), suite="other suite/with slash")
+    assert len(store.list()) == 4
+    assert len(store.list(suite="warden")) == 3
+    assert len(store.list(suite="warden", fingerprint="abcdefabcdef")) == 2
+    assert len(store.list(suite="warden", limit=1)) == 1
+    assert store.list(suite="other suite/with slash")[0].suite == "other suite/with slash"
+    assert store.list(limit=0) == []
+
+
+def test_sqlite_store_on_a_fresh_path_lists_nothing_and_survives_reopening(tmp_path: Path) -> None:
+    path = tmp_path / "evals.db"
+    assert SqliteReportStore(path).list() == []
+    SqliteReportStore(path).put(_report(passed=1, total=1), suite="warden", report_id="build-42")
+    again = SqliteReportStore(path)
+    assert [item.report_id for item in again.list(suite="warden")] == ["build-42"]
+    assert again.get("build-42") is not None
+
+
+def test_sqlite_store_keeps_a_callers_id_and_refuses_a_blank_one(tmp_path: Path) -> None:
+    store = SqliteReportStore(tmp_path / "evals.db")
+    stored = store.put(_report(passed=1, total=1), suite="warden", report_id="build 42/x")
+    assert stored.report_id == "build 42/x"
+    assert store.get("build 42/x") is not None
+    generated = store.put(_report(passed=1, total=1), suite="warden")
+    assert len(generated.report_id) == 32
+    with pytest.raises(ValueError, match="blank"):
+        store.put(_report(passed=1, total=1), suite="warden", report_id="  ")
+
+
+def test_trend_reads_from_a_sqlite_store(tmp_path: Path) -> None:
+    store = SqliteReportStore(tmp_path / "evals.db")
+    _three_reports(store)
+    result = trend(store, suite="warden", last=3)
+    assert len(result.points) == 3
 
 
 # --------------------------------------------------------------------------

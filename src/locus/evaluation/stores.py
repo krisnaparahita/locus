@@ -11,9 +11,11 @@ hundredth a day, did the suite itself change under the numbers. A
 suite and by fingerprint, and :func:`trend` reads the last N of one suite
 back, newest first, and says where each moved against the one before it.
 
-Four stores share one interface:
+Five stores share one interface:
 
 - :class:`FileReportStore`: a directory, one JSON file per report.
+- :class:`SqliteReportStore`: one local SQLite file, the report as JSON with
+  its headline figures in columns; history you can query with no server.
 - :class:`OracleReportStore`: a table on an Oracle AI Database, the report
   as JSON with its headline figures in columns, so a query can trend a
   suite without reading every report.
@@ -24,6 +26,7 @@ Four stores share one interface:
 ``locus eval run --store`` and ``locus eval trend`` name theirs::
 
     file:///var/lib/locus/evals          or a bare path
+    sqlite:///var/lib/locus/evals.db     (sqlite:// + an absolute path)
     oracle://user:pw@/?dsn=mydb_low&wallet=/opt/wallet&table=LOCUS_EVAL_REPORTS
     oci://<namespace>/<bucket>/<prefix>?profile=DEFAULT&region=eu-frankfurt-1
     s3://<bucket>/<prefix>?endpoint_url=https://...
@@ -39,6 +42,7 @@ from __future__ import annotations
 
 import os
 import re
+import sqlite3
 import threading
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -64,6 +68,7 @@ __all__ = [
     "OracleReportStore",
     "ReportStore",
     "S3ReportStore",
+    "SqliteReportStore",
     "StoredReport",
     "Trend",
     "TrendPoint",
@@ -289,6 +294,133 @@ class FileReportStore(_ObjectStore):
             for path in self.directory.rglob("*.json")
             if str(path.relative_to(self.directory)).replace(os.sep, "/").startswith(prefix)
         )
+
+
+class SqliteReportStore:
+    """Reports in one local SQLite file: the report as JSON, headline figures in columns.
+
+    One table (``locus_eval_reports``), indexed on suite and timestamp, so a
+    trend reads columns without parsing every report. A connection is opened
+    per call, so the store is safe to share between threads. Putting a
+    ``report_id`` that already exists replaces that report.
+    """
+
+    TABLE = "locus_eval_reports"
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path).expanduser()
+        self.spec = f"sqlite://{self.path}"
+        self._ready = False
+        self._lock = threading.Lock()
+
+    def _connect(self) -> sqlite3.Connection:
+        with self._lock:
+            if not self._ready:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                conn = sqlite3.connect(self.path)
+                try:
+                    conn.executescript(
+                        f"""
+                        CREATE TABLE IF NOT EXISTS {self.TABLE} (
+                            report_id TEXT PRIMARY KEY,
+                            suite TEXT NOT NULL,
+                            fingerprint TEXT,
+                            created_at TEXT NOT NULL,
+                            total_cases INTEGER NOT NULL,
+                            passed INTEGER NOT NULL,
+                            failed INTEGER NOT NULL,
+                            not_graded INTEGER NOT NULL,
+                            avg_score REAL NOT NULL,
+                            report TEXT NOT NULL
+                        );
+                        CREATE INDEX IF NOT EXISTS {self.TABLE}_suite_created
+                            ON {self.TABLE} (suite, created_at);
+                        CREATE INDEX IF NOT EXISTS {self.TABLE}_created
+                            ON {self.TABLE} (created_at);
+                        """
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+                self._ready = True
+        return sqlite3.connect(self.path)
+
+    def put(self, report: EvalReport, *, suite: str, report_id: str | None = None) -> StoredReport:
+        report_id = report_id or uuid4().hex
+        if not report_id.strip():
+            raise ValueError("report_id must not be blank")
+        conn = self._connect()
+        try:
+            with conn:
+                conn.execute(
+                    f"INSERT OR REPLACE INTO {self.TABLE} (report_id, suite, fingerprint, "  # noqa: S608 — constant table name
+                    "created_at, total_cases, passed, failed, not_graded, avg_score, report) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        report_id,
+                        suite,
+                        report.fingerprint,
+                        _stamp(report.created_at),
+                        report.total_cases,
+                        report.passed,
+                        report.failed,
+                        report.not_graded,
+                        report.avg_score,
+                        report.model_dump_json(indent=2),
+                    ),
+                )
+        finally:
+            conn.close()
+        return StoredReport.of(report, report_id=report_id, suite=suite, location=str(self.path))
+
+    def get(self, report_id: str) -> EvalReport | None:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                f"SELECT report FROM {self.TABLE} WHERE report_id = ?",  # noqa: S608 — constant table name
+                (report_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        return None if row is None else EvalReport.model_validate_json(row[0])
+
+    def list(
+        self, *, suite: str | None = None, fingerprint: str | None = None, limit: int = 20
+    ) -> list[StoredReport]:
+        clauses: list[str] = []
+        binds: list[Any] = []
+        if suite:
+            clauses.append("suite = ?")
+            binds.append(suite)
+        if fingerprint is not None:
+            clauses.append("fingerprint = ?")
+            binds.append(fingerprint)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT report_id, suite, fingerprint, created_at, total_cases, passed, "  # noqa: S608 — constant table, bound values
+                f"failed, not_graded, avg_score FROM {self.TABLE}{where} "
+                "ORDER BY created_at DESC, report_id DESC LIMIT ?",
+                (*binds, max(0, limit)),
+            ).fetchall()
+        finally:
+            conn.close()
+        return [
+            StoredReport(
+                report_id=r[0],
+                suite=r[1],
+                fingerprint=r[2],
+                created_at=_unstamp(r[3]),
+                total_cases=r[4],
+                passed=r[5],
+                failed=r[6],
+                not_graded=r[7],
+                avg_score=r[8],
+                location=str(self.path),
+            )
+            for r in rows
+        ]
 
 
 class OCIBucketReportStore(_ObjectStore):
@@ -895,6 +1027,8 @@ def report_store(spec: str | None = None) -> ReportStore:
     if scheme in ("", "file"):
         path = spec[len("file://") :] if scheme == "file" else spec
         return FileReportStore(path)
+    if scheme == "sqlite":
+        return SqliteReportStore(spec[len("sqlite://") :])
     if scheme == "oracle":
         return _oracle(spec)
     if scheme == "oci":
@@ -902,7 +1036,7 @@ def report_store(spec: str | None = None) -> ReportStore:
     if scheme == "s3":
         return _s3(spec)
     raise ValueError(
-        f"unknown report store scheme {scheme!r}: expected file://, oracle://, oci:// or s3://"
+        f"unknown report store scheme {scheme!r}: expected file://, sqlite://, oracle://, oci:// or s3://"
     )
 
 

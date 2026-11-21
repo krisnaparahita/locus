@@ -10,6 +10,12 @@ policy.
 
 ### Added
 
+- **`SqliteReportStore`.** A local, queryable evaluation report history with no
+  server: one SQLite table (report as JSON, headline figures in columns,
+  indexed on suite and timestamp) with the same semantics as
+  `FileReportStore`. `report_store()`, `locus eval run --store` and
+  `locus eval trend` open one from a `sqlite:///path/to/evals.db` spec.
+
 - **A command-line reference.** `docs/how-to/command-line.md` documents the
   `locus` command; its table of subcommands and actions is rendered at docs
   build time from `locus.cli.build_parser()` through `{{ locus_cli_reference }}`,
